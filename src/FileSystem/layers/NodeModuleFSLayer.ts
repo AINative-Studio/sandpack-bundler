@@ -51,7 +51,25 @@ export class NodeModuleFSLayer extends FSLayer {
     throw new Error(`File not found in unpkg cache: ${moduleName}@${moduleVersion} - ${path}`);
   }
 
-  /** Turns a path into [moduleName, relativePath] */
+  /**
+   * Turns a path into [moduleName, relativePath].
+   *
+   * relativePath is returned WITH its leading slash intact (e.g. "/index.js",
+   * not "index.js") to match the key convention `module.files` is actually
+   * stored under. Two independent, already-working code paths confirm this:
+   * module-cdn.ts's fetchModule() builds `files[path]` directly from
+   * sandpack-cdn's real /v2/mod/ msgpack keys with zero transformation, and
+   * module-registry/index.ts's loadModuleDependencies() (_writePrecompiledModule)
+   * iterates the SAME `nodeModule.files` map and does no stripping either when
+   * it successfully resolves react/react-dom. Previously this stripped the
+   * leading slash via `.substring(1)`, so every lookup here (readFileSync,
+   * readFileAsync, isFileSync) searched for e.g. "index.js" against a map
+   * keyed "/index.js" -- a guaranteed miss for any file looked up through
+   * this FS layer. react/react-dom appeared to work anyway only because they
+   * were resolved earlier in the pipeline via _writePrecompiledModule, not
+   * this layer -- the miss only surfaced once react-refresh/runtime.js (via
+   * ReactPreset.augmentDependencies) hit this specific lookup path.
+   */
   private getModuleFromPath(path: string): [string, string] {
     const parts = path.match(MODULE_PATH_RE);
     if (!parts) {
@@ -59,7 +77,7 @@ export class NodeModuleFSLayer extends FSLayer {
     }
     const moduleName = parts[1];
     const modulePath: string = parts[2] ?? '';
-    return [moduleName, modulePath.substring(1)];
+    return [moduleName, modulePath];
   }
 
   readFileSync(path: string): string {

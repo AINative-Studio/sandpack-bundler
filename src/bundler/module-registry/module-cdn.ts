@@ -45,8 +45,18 @@ import { DepMap } from '.';
  */
 
 /** Configurable origin for our self-hosted sandpack-cdn fork (issue #1071).
- *  Falls back to a loopback dev default; MUST be overridden in any real
- *  deployment via this global before the bundler boots. */
+ *  Resolution order:
+ *    1. window.__AINATIVE_SANDPACK_CDN_URL__ -- runtime override, settable
+ *       without a rebuild (e.g. by a host page's own bootstrap script, or a
+ *       test harness that controls the bundler iframe's own document).
+ *    2. process.env.AINATIVE_CDN_URL -- build-time default, baked in via
+ *       Parcel's env substitution the same way sandpack-client's rollup
+ *       config bakes in AINATIVE_BUNDLER_URL (see that fork's
+ *       clients/runtime/index.ts). Set this when running `yarn build` for
+ *       any real deployment.
+ *    3. Loopback dev default -- intentionally fails fast and loudly
+ *       (connection refused / CORS) instead of silently hitting someone
+ *       else's infrastructure when neither override is configured. */
 declare global {
   interface Window {
     __AINATIVE_SANDPACK_CDN_URL__?: string;
@@ -57,9 +67,9 @@ function getCdnRoot(): string {
   if (typeof window !== 'undefined' && window.__AINATIVE_SANDPACK_CDN_URL__) {
     return window.__AINATIVE_SANDPACK_CDN_URL__;
   }
-  // Placeholder until #1071 posts its real deployed URL -- intentionally
-  // loopback so a misconfigured deployment fails fast and loudly (connection
-  // refused) instead of silently hitting someone else's infrastructure.
+  if (typeof process !== 'undefined' && process.env && process.env.AINATIVE_CDN_URL) {
+    return process.env.AINATIVE_CDN_URL;
+  }
   return 'http://localhost:8080/';
 }
 

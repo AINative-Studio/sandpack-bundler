@@ -146,6 +146,32 @@ async function fetchWithTimeout(
   throw lastErr;
 }
 
+/**
+ * sandpack-cdn's resolutions map keys are NOT bare package names --
+ * verified against real deployed output (issue #1071's own verification
+ * comment): resolving react@18.2.0 returns keys like "react@18",
+ * "js-tokens@4", "loose-envify@1". Confirmed in source,
+ * dep_tree_builder.rs's `add_dependency`:
+ *
+ *   let mut key = String::from(name);
+ *   key.push('@');
+ *   key.push_str(&version.major.to_string());
+ *
+ * This is a deliberate design (lets different major versions of the
+ * same package coexist in one resolution map), not an oversight -- but
+ * it means the key is "{name}@{majorVersion}", and this bundler's
+ * IResolvedDependency.n field needs the bare package name, since
+ * fetchModule(name, version) and ModuleRegistry's module cache (keyed
+ * by bare name) both expect it unsuffixed. Strip only the FINAL
+ * "@{digits}" segment -- scoped packages like "@babel/core@7" contain a
+ * second, leading "@" that must be left alone.
+ */
+const TRAILING_MAJOR_VERSION_SUFFIX = /@\d+$/;
+
+function stripMajorVersionSuffix(key: string): string {
+  return key.replace(TRAILING_MAJOR_VERSION_SUFFIX, '');
+}
+
 export async function fetchManifest(deps: DepMap): Promise<IResolvedDependency[]> {
   const encodedQuery = encodeDepsQuery(deps);
   const url = urlJoin(getCdnRoot(), `/v2/deps/${encodedQuery}`);
@@ -153,15 +179,15 @@ export async function fetchManifest(deps: DepMap): Promise<IResolvedDependency[]
   const buffer = await result.arrayBuffer();
   const resolutions = decodeMsgPack(buffer) as SandpackCdnResolutionsMap;
 
-  // Adapt sandpack-cdn's flat {name: version} map into this bundler's
-  // expected IResolvedDependency[] shape. sandpack-cdn's resolver doesn't
-  // report per-package depth in the tree (it returns only the final
-  // resolution, not the resolution path) -- depth is used elsewhere in
-  // this bundler only as a priority/ordering hint for preloadModules'
-  // Promise.all, which has no ordering dependency on depth being accurate,
-  // so a constant 0 is a correct (if less optimized) value, not a
-  // correctness bug.
-  return Object.entries(resolutions).map(([n, v]) => ({ n, v, d: 0 }));
+  // Adapt sandpack-cdn's flat {"{name}@{major}": resolvedVersion} map into
+  // this bundler's expected IResolvedDependency[] shape (bare name, not
+  // name@major). sandpack-cdn's resolver doesn't report per-package depth
+  // in the tree (it returns only the final resolution, not the resolution
+  // path) -- depth is used elsewhere in this bundler only as a
+  // priority/ordering hint for preloadModules' Promise.all, which has no
+  // ordering dependency on depth being accurate, so a constant 0 is a
+  // correct (if less optimized) value, not a correctness bug.
+  return Object.entries(resolutions).map(([key, v]) => ({ n: stripMajorVersionSuffix(key), v, d: 0 }));
 }
 
 export type CDNModuleFileType = ICDNModuleFile | number;

@@ -239,11 +239,31 @@ export interface ICDNModule {
 const strictTextDecoder = new TextDecoder('utf-8', { fatal: true });
 
 export async function fetchModule(name: string, version: string): Promise<ICDNModule> {
+  // AINative perf-profiling instrumentation (issue builder-ainative-studio#1089).
+  // Verifies CDN fetch/decode is still fast (as #1082 already found) and
+  // isn't a hidden contributor to barrel-package compile time. No-op
+  // unless window.__SANDPACK_PROFILE__ is set.
+  const profiling = typeof window !== 'undefined' && !!(window as any).__SANDPACK_PROFILE__;
+  const tStart = profiling ? performance.now() : 0;
   const encodedSpecifier = encodeModSpecifier(name, version);
   const url = urlJoin(getCdnRoot(), `/v2/mod/${encodedSpecifier}`);
   const result = await fetchWithTimeout(url, { maxRetries: 5 });
   const buffer = await result.arrayBuffer();
+  const tAfterFetch = profiling ? performance.now() : 0;
   const rawFiles = decodeMsgPack(buffer) as SandpackCdnFileMap;
+  if (profiling) {
+    const tAfterDecode = performance.now();
+    const w = window as any;
+    w.__sandpackCdnEntries = w.__sandpackCdnEntries || [];
+    w.__sandpackCdnEntries.push({
+      name,
+      version,
+      byteLength: buffer.byteLength,
+      fetchMs: +(tAfterFetch - tStart).toFixed(3),
+      decodeMs: +(tAfterDecode - tAfterFetch).toFixed(3),
+      numFiles: Object.keys(rawFiles).length,
+    });
+  }
 
   const files: Record<string, ICDNModuleFile> = {};
   for (const [path, bytes] of Object.entries(rawFiles)) {

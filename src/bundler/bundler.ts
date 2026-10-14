@@ -203,6 +203,14 @@ export class Bundler {
   }
 
   private async _transformModule(path: string): Promise<Module> {
+    // AINative perf-profiling instrumentation (issue builder-ainative-studio#1089).
+    // Times the dependency-walker step itself (file read, module.compile()
+    // i.e. the babel round-trip, and dependency resolution), separate from
+    // the per-transform breakdown collected in babel-worker.ts. Gated the
+    // same way -- no-op unless window.__SANDPACK_PROFILE__ is set.
+    const profiling = typeof window !== 'undefined' && !!(window as any).__SANDPACK_PROFILE__;
+    const tStart = profiling ? performance.now() : 0;
+
     let module = this.modules.get(path);
     if (module) {
       if (module.compiled != null) {
@@ -217,10 +225,25 @@ export class Bundler {
       module = new Module(path, content, false, this);
       this.modules.set(path, module);
     }
+    const tAfterRead = profiling ? performance.now() : 0;
     await module.compile();
+    const tAfterCompile = profiling ? performance.now() : 0;
     for (let dep of module.dependencies) {
       const resolvedDependency = await this.resolveAsync(dep, module.filepath);
       this.transformModule(resolvedDependency);
+    }
+    if (profiling) {
+      const tEnd = performance.now();
+      const w = window as any;
+      w.__sandpackWalkEntries = w.__sandpackWalkEntries || [];
+      w.__sandpackWalkEntries.push({
+        path,
+        readMs: +(tAfterRead - tStart).toFixed(3),
+        compileMs: +(tAfterCompile - tAfterRead).toFixed(3),
+        resolveDepsMs: +(tEnd - tAfterCompile).toFixed(3),
+        totalMs: +(tEnd - tStart).toFixed(3),
+        numDeps: module.dependencies.size,
+      });
     }
     return module;
   }

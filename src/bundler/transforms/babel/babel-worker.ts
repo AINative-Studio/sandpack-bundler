@@ -129,12 +129,162 @@ async function getPlugins(plugins: any): Promise<PluginItem[]> {
   return result;
 }
 
+// AINative perf-profiling instrumentation (issue builder-ainative-studio#1089).
+// Temporary: real wall-clock breakdown of where transform() time actually
+// goes, per call -- preset/plugin resolution vs. the babel.transform() call
+// itself vs. total. Reported back over the existing debug channel so it is
+// visible from the host page (the worker's own console is not reachable
+// from outside the iframe). Guarded by a global flag so it's a no-op unless
+// explicitly enabled -- never runs in normal operation.
+declare const self: any;
+let PROFILE_ENABLED = false;
+let __profileBuf: any[] = [];
+function profileLog(entry: any) {
+  if (!PROFILE_ENABLED) return;
+  __profileBuf.push(entry);
+  if (__profileBuf.length >= 25) {
+    flushProfile();
+  }
+}
+function flushProfile() {
+  if (!PROFILE_ENABLED || __profileBuf.length === 0) return;
+  const batch = __profileBuf;
+  __profileBuf = [];
+  try {
+    (self as any).postMessage({ channel: 'sandpack-profile', entries: batch });
+  } catch {
+    // best-effort only
+  }
+}
+if (typeof self !== 'undefined' && typeof self.addEventListener === 'function') {
+  self.addEventListener('message', (evt: any) => {
+    if (evt?.data?.channel === 'sandpack-profile-enable') {
+      PROFILE_ENABLED = true;
+    }
+  });
+  // Bounded periodic flush (not unbounded -- fixed 500ms cadence, buffer
+  // capped at 25 entries above) so a compile with < 25 transformed files
+  // still reports its profile data instead of sitting in the buffer forever.
+  setInterval(() => flushProfile(), 500);
+}
+
+// AINative perf fix (issue builder-ainative-studio#1089): content-addressed
+// transform cache.
+//
+// Real profiling (see this PR's description for full numbers) found the
+// dominant cost compiling a barrel-exporting package like lucide-react is
+// NOT any specific misconfigured transform (preset/plugin setup measured
+// at <1ms/call) -- it's the sheer VOLUME of babel.transform() calls, most
+// of them on tiny node_modules files that are byte-identical on every
+// single compile: our self-hosted sandpack-cdn always serves raw,
+// never-pre-transpiled bytes (see module-cdn.ts's correctness note on
+// ICDNModuleFile.t), so this bundler's dependency walker pays the full
+// Babel cost for every node_modules file on every compile, with no reuse
+// across compiles even when the input is identical. A single real compile
+// of a trivial one-icon app made ~1455 babel.transform() calls; 1405 of
+// those were on lucide-react's individual icon files averaging ~620 bytes
+// each but ~19ms apiece of call overhead, summing to ~26s alone.
+//
+// Fix: cache the full transform RESULT (code + discovered dependency set
+// -- both are required downstream; dependencies drive Module.compile's
+// addDependency walk, see Module.ts) keyed by a hash of the exact input
+// (code + filepath's node_modules-ness + a digest of the resolved
+// presets/plugins config). Node_modules source is immutable per package
+// version, so the mapping (code, config) -> (compiledCode, dependencies)
+// is pure and safe to memoize for the lifetime of this worker -- which
+// lives for one bundler/iframe instance (one Sandpack preview session),
+// not across page loads, so there is no staleness risk from a package
+// version changing between sessions.
+//
+// Bounded, not unbounded: a plain Map would grow without limit across a
+// long editing session (HMR recompiles constantly touch the same
+// node_modules files, which is exactly the case this cache targets, but a
+// pathological session importing many huge/distinct packages over time
+// could otherwise accumulate indefinitely). CACHE_MAX_ENTRIES caps entry
+// count with simple FIFO eviction (oldest inserted key dropped first) --
+// not true LRU, but sufficiently effective here since the hot set (the
+// current app's actual dependency graph, typically a few hundred files at
+// most) is far smaller than the cap, so eviction in practice only trims
+// truly cold entries from a prior, now-abandoned dependency graph.
+const CACHE_MAX_ENTRIES = 4000;
+const transformCache = new Map<string, ITranspilationResult>();
+
+// Fast, non-cryptographic string hash (FNV-1a, 32-bit). This is a cache
+// key, not a security boundary -- collision resistance only needs to be
+// "good enough to not matter in practice for a few thousand entries",
+// and FNV-1a is dramatically cheaper than crypto.subtle.digest (no
+// async round-trip, no Promise overhead per call -- which would itself
+// reintroduce a per-call tax against the exact problem this cache
+// exists to remove).
+function fnv1a(str: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  // Also fold in length -- fnv1a over very different strings that happen
+  // to collide in the 32-bit space is already astronomically unlikely,
+  // but length gives a second cheap discriminant for near-free extra
+  // safety margin.
+  return (hash >>> 0).toString(36) + ':' + str.length;
+}
+
+function cacheKeyFor(code: string, filepath: string, isNodeModule: boolean, config: any): string {
+  // Only the parts of `config` that actually affect output need to be in
+  // the key. In practice config is static per isNodeModule bucket (see
+  // getPresets/getPlugins above), so isNodeModule is almost always
+  // sufficient on its own -- but a caller-supplied config.presets/plugins
+  // array is cheap to fold in too, and doing so makes this correct even
+  // if that assumption ever stops holding, rather than relying on it.
+  const configDigest = config ? fnv1a(JSON.stringify(config)) : 'noconfig';
+  return `${isNodeModule ? '1' : '0'}|${configDigest}|${fnv1a(code)}|${filepath.slice(filepath.lastIndexOf('/') + 1)}`;
+}
+
 async function transform({ code, filepath, config }: ITransformData): Promise<ITranspilationResult> {
-  const requires: Set<string> = new Set();
+  const t0 = PROFILE_ENABLED ? performance.now() : 0;
   const isNodeModule = /node_modules/.test(filepath);
+
+  // Only cache node_modules files. App source is actively edited (HMR),
+  // so caching it would need invalidation machinery for no real benefit
+  // -- the volume problem this cache targets is entirely in node_modules
+  // (1454/1455 and 1513/1514 of all transform calls in the two real
+  // profiling runs backing this fix were on node_modules files).
+  const cacheKey = isNodeModule ? cacheKeyFor(code, filepath, isNodeModule, config) : null;
+  if (cacheKey) {
+    const cached = transformCache.get(cacheKey);
+    if (cached) {
+      // transformCache only ever stores the success shape (see the write
+      // site below -- a BundlerError is never cached), so this cast is
+      // safe.
+      const typed = cached as { code: string; dependencies: Set<string> };
+      if (PROFILE_ENABLED) {
+        const t1 = performance.now();
+        profileLog({
+          filepath,
+          isNodeModule,
+          codeLen: code.length,
+          presetsSetupMs: 0,
+          babelTransformMs: 0,
+          totalMs: +(t1 - t0).toFixed(3),
+          numRequires: typed.dependencies.size,
+          cacheHit: true,
+        });
+      }
+      // Sets are mutable and this cache value may be returned to many
+      // callers -- hand back a fresh Set each time so one caller mutating
+      // its result (nothing in this bundler currently does, but Module.ts
+      // only reads it via Array.from/iteration, so this is a defensive
+      // copy, not a workaround for an observed bug) can never corrupt the
+      // cached entry for the next hit.
+      return { code: typed.code, dependencies: new Set(typed.dependencies) };
+    }
+  }
+
+  const requires: Set<string> = new Set();
   const presets = await getPresets(config?.presets ?? [], isNodeModule);
   const plugins = await getPlugins(config?.plugins ?? []);
   plugins.push(collectDependencies(requires));
+  const t1 = PROFILE_ENABLED ? performance.now() : 0;
   const transformed = babel.transform(code, {
     filename: filepath,
     presets,
@@ -144,16 +294,45 @@ async function transform({ code, filepath, config }: ITransformData): Promise<IT
     sourceMaps: 'inline',
     compact: isNodeModule,
   });
+  const t2 = PROFILE_ENABLED ? performance.now() : 0;
+
+  if (PROFILE_ENABLED) {
+    profileLog({
+      filepath,
+      isNodeModule,
+      codeLen: code.length,
+      presetsSetupMs: +(t1 - t0).toFixed(3),
+      babelTransformMs: +(t2 - t1).toFixed(3),
+      totalMs: +(t2 - t0).toFixed(3),
+      numRequires: requires.size,
+      cacheHit: false,
+    });
+  }
 
   // no-op module
   if (!transformed.code) {
     transformed.code = 'module.exports = {};';
   }
 
-  return {
+  const result: ITranspilationResult = {
     code: transformed.code,
     dependencies: requires,
   };
+
+  if (cacheKey) {
+    if (transformCache.size >= CACHE_MAX_ENTRIES) {
+      // FIFO eviction: Map iteration order is insertion order, so the
+      // first key is the oldest. O(1) amortized, no extra bookkeeping
+      // structure needed.
+      const oldestKey = transformCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        transformCache.delete(oldestKey);
+      }
+    }
+    transformCache.set(cacheKey, result);
+  }
+
+  return result;
 }
 
 new WorkerMessageBus({

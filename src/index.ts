@@ -13,6 +13,18 @@ import * as logger from './utils/logger';
 
 const bundlerStartTime = Date.now();
 
+// AINative perf-profiling instrumentation (issue builder-ainative-studio#1089).
+// This bundler runs inside a cross-origin iframe -- a hosting debug page
+// cannot reach into it to set window.__SANDPACK_PROFILE__ directly. Reading
+// a `?profile=1` query param on the bundler's OWN url (set by the harness
+// when it points the iframe's src at this page) is the only way a host
+// page can toggle this without a same-origin postMessage handshake. Only
+// ever enables additional timing instrumentation; never affects
+// compilation behavior or output.
+if (typeof window !== 'undefined' && /(?:^|[?&])profile=1(?:&|$)/.test(window.location.search)) {
+  (window as any).__SANDPACK_PROFILE__ = true;
+}
+
 class SandpackInstance {
   private messageBus: IFrameParentMessageBus;
   private disposableStore = new DisposableStore();
@@ -122,6 +134,14 @@ class SandpackInstance {
   }
 
   async handleCompile(compileRequest: ICompileRequest) {
+    // AINative perf-profiling instrumentation (issue builder-ainative-studio#1089).
+    // Real wall-clock handleCompile:start -> evaluate:success span, plus a
+    // snapshot of the walk/CDN entries collected in bundler.ts /
+    // module-cdn.ts, relayed to the host page once the compile finishes.
+    // No-op unless window.__SANDPACK_PROFILE__ is set (see those files).
+    const profiling = typeof window !== 'undefined' && !!(window as any).__SANDPACK_PROFILE__;
+    const profileCompileStart = profiling ? performance.now() : 0;
+
     if (compileRequest.logLevel != null) {
       logger.setLogLevel(compileRequest.logLevel);
     }
@@ -211,6 +231,24 @@ class SandpackInstance {
 
     logger.debug(logger.logFactory('Finished', `in ${Date.now() - bundlerStartTime}ms`));
     this.messageBus.sendMessage('status', { status: 'done' });
+
+    if (profiling) {
+      const w = window as any;
+      try {
+        window.parent.postMessage(
+          {
+            __sandpackProfile: 'compile-summary',
+            totalCompileMs: +(performance.now() - profileCompileStart).toFixed(3),
+            walkEntries: w.__sandpackWalkEntries || [],
+            cdnEntries: w.__sandpackCdnEntries || [],
+            babelEntries: w.__sandpackProfileEntries || [],
+          },
+          '*'
+        );
+      } catch {
+        // best-effort only
+      }
+    }
   }
 
   dispose() {

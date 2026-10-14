@@ -141,7 +141,17 @@ export class Module {
 
     // Reset hmr context while keeping the previous hot data
     this.hot = this.hot.clone();
+    // AINative fix (issue builder-ainative-studio#1089): assign BEFORE
+    // running the module body (Evaluation.run(), below), not after. See
+    // Evaluation.ts's doc comment -- this ordering is what lets a
+    // circular require hit evaluate()'s `if (this.evaluation) return
+    // this.evaluation` short-circuit instead of recursing into a fresh
+    // Evaluation (and fresh module-body execution) every time, which is
+    // what caused a real RangeError: Maximum call stack size exceeded on
+    // a genuine Builder app's victory-vendor/d3-interpolate circular
+    // require (value.js <-> array.js).
     this.evaluation = new Evaluation(this);
+    this.evaluation.run();
 
     // this.bundler.setHmrStatus('apply');
     if (this.hot.hmrConfig && this.hot.hmrConfig.isHot()) {

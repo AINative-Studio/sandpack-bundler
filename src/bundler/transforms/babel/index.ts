@@ -2,7 +2,7 @@ import { CompilationError } from '../../../errors/CompilationError';
 import * as logger from '../../../utils/logger';
 import { WorkerMessageBus } from '../../../utils/WorkerMessageBus';
 import { ITranspilationContext, ITranspilationResult, Transformer } from '../Transformer';
-import { ITransformData } from './babel-worker';
+import { ICollectImportsData, ICollectImportsResult, ITransformData } from './babel-worker';
 
 // AINative perf fix (issue builder-ainative-studio#1089): a small, FIXED-size
 // pool of Babel workers instead of one.
@@ -101,10 +101,39 @@ export class BabelTransformer extends Transformer {
       throw new Error('Babel worker pool has not been initialized');
     }
 
+    // AINative tree-shaking fix (issue builder-ainative-studio#1089): look
+    // up whether this exact file's resolved path is a barrel this
+    // compile's pre-pass (Bundler.collectAppBarrelUsage) has a
+    // fully-known usage set for. Deliberately a plain lookup keyed by
+    // this module's own filepath, not a config field threaded through
+    // Preset.mapTransformers -- the allowed-names set is dynamic
+    // per-compile data computed from the app's actual source, not a
+    // static per-filetype transform config.
+    //
+    // Awaiting barrelUsagePromise here is a defense-in-depth backstop,
+    // not the real correctness guarantee -- bundler.ts's compile() ALSO
+    // awaits it directly before the entry-point walk even starts (see
+    // that call site's doc comment for a real correctness bug found and
+    // fixed when an earlier version of this fix tried making that await
+    // non-blocking: Module.compile()'s short-circuit on `compiled !=
+    // null` has no knowledge of this promise, so a node_modules module
+    // could be reached and returned stale before a non-blocking
+    // collectAppBarrelUsage() ever got a chance to widen it). By the
+    // time ANY transform call reaches this line, barrelUsagePromise is
+    // therefore already resolved in the only call path this bundler
+    // actually uses -- this await exists only so a future caller that
+    // forgets compile()'s own await still gets the correct, if slower,
+    // behavior instead of a silent stale read.
+    if (ctx.module.bundler.barrelUsagePromise) {
+      await ctx.module.bundler.barrelUsagePromise;
+    }
+    const barrelAllowedNames = ctx.module.bundler.barrelUsage?.get(ctx.module.filepath);
+
     const data: ITransformData = {
       code: ctx.code,
       filepath: ctx.module.filepath,
       config,
+      barrelAllowedNames,
     };
 
     // Simple round-robin dispatch. No per-file affinity needed: each
@@ -120,5 +149,21 @@ export class BabelTransformer extends Transformer {
     } catch (err: unknown) {
       return new CompilationError(err as Error, ctx.module.filepath);
     }
+  }
+
+  /** AINative tree-shaking fix (issue builder-ainative-studio#1089). Used
+   *  only by Bundler.collectAppBarrelUsage()'s pre-pass -- see that
+   *  method and barrel-usage.ts's doc comment for the full design. Runs
+   *  the collection-mode plugin against one app source file and returns
+   *  which named bindings it imports from each bare specifier, without
+   *  producing (or caching) any real transform output. */
+  async collectImports(data: ICollectImportsData): Promise<ICollectImportsResult> {
+    if (this.messageBuses.length === 0) {
+      throw new Error('Babel worker pool has not been initialized');
+    }
+    const workerIndex = this.nextWorkerIndex;
+    this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.messageBuses.length;
+    const messageBus = this.messageBuses[workerIndex];
+    return messageBus.request('collectImports', data);
   }
 }

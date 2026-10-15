@@ -126,6 +126,54 @@ export class Module {
     this.bundler.transformModule(this.filepath);
   }
 
+  /**
+   * AINative tree-shaking fix (issue builder-ainative-studio#1089).
+   *
+   * A narrower sibling of resetCompilation(), for exactly one case:
+   * Bundler.collectAppBarrelUsage()'s widen-detection in compile()
+   * discovers that a node_modules barrel file (e.g. lucide-react's main
+   * entry) was already compiled under a stale, too-narrow set of
+   * allowed re-export names -- an app-level HMR edit added a new named
+   * import this file's previous compile had trimmed away.
+   *
+   * resetCompilation() is the wrong tool here: it is designed for a
+   * module whose SOURCE changed and that needs either a real HMR-dirty
+   * flag (if something called module.hot.accept() on it) or a full page
+   * reload (if nothing did -- its only other option). A third-party
+   * npm package's own file is never itself HMR-aware (nothing inside
+   * lucide-react calls module.hot.accept()), so resetCompilation() would
+   * unconditionally take the reload branch here -- turning a normal,
+   * already-successful HMR update of the APP's own file (which DOES have
+   * an HMR context, via react-refresh) into a disruptive full-page
+   * reload, every time a widen is detected. That's a real regression
+   * (confirmed via a live HMR test: without this method, re-running
+   * resetCompilation() on the barrel file reloaded the iframe and the
+   * app lost its render until the reload's own fresh compile finished).
+   *
+   * This file's *source* never changed -- only which of its exports this
+   * compile decided to keep. There's nothing to "hot swap" in the
+   * running page for this file specifically (it has never been
+   * evaluated under a wider name set, so there's no stale closure of
+   * its previous, narrower exports living in memory that needs
+   * invalidating client-side); the module whose evaluated state actually
+   * changes is the APP file that gained the new import, and recompiling
+   * that is already the entry-point walk's normal job, triggered the
+   * normal way, already happening for entirely separate reasons as part
+   * of this same compile. All this needs to do is make sure the NEXT
+   * time something resolves this file's path, it re-runs Module.compile
+   * instead of returning the stale cached result -- clear the compiled
+   * output and dependency bookkeeping, and re-queue a transform, with no
+   * HMR-dirty flag and no reload.
+   */
+  resetForWidenedBarrelUsage(): void {
+    this.compilationError = null;
+    this.compiled = null;
+    this.evaluation = null;
+    this.dependencies = new Set();
+    this.dependencyMap = new Map();
+    this.bundler.transformModule(this.filepath);
+  }
+
   evaluate(): Evaluation {
     if (this.evaluation) {
       return this.evaluation;

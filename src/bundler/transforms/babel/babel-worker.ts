@@ -5,12 +5,23 @@ import * as logger from '../../../utils/logger';
 import { WorkerMessageBus } from '../../../utils/WorkerMessageBus';
 import { ITranspilationResult } from '../Transformer';
 import { loadPlugin, loadPreset } from './babel-plugin-registry';
+import { BarrelAllowedNames, barrelAwarePlugin } from './barrel-usage';
 import { collectDependencies } from './dep-collector';
 
 export interface ITransformData {
   code: string;
   filepath: string;
   config: any;
+  /** AINative tree-shaking fix (issue builder-ainative-studio#1089). See
+   *  barrel-usage.ts's doc comment for the full design. When set (only
+   *  ever for a node_modules file bundler.ts has identified as a barrel
+   *  whose usage is fully known), the barrel-trimming plugin runs on this
+   *  transform call and removes `export { X } from './y'` specifiers
+   *  whose exported name isn't in this list. Omitted (undefined) means
+   *  "transform exactly as before this fix" -- the only way this field
+   *  ever affects output is by REMOVING re-export statements this fix can
+   *  prove are unused; it never changes any other statement. */
+  barrelAllowedNames?: BarrelAllowedNames;
 }
 
 function getNameFromConfigEntry(entry: any): string | null {
@@ -229,7 +240,13 @@ function fnv1a(str: string): string {
   return (hash >>> 0).toString(36) + ':' + str.length;
 }
 
-function cacheKeyFor(code: string, filepath: string, isNodeModule: boolean, config: any): string {
+function cacheKeyFor(
+  code: string,
+  filepath: string,
+  isNodeModule: boolean,
+  config: any,
+  barrelAllowedNames: BarrelAllowedNames | undefined
+): string {
   // Only the parts of `config` that actually affect output need to be in
   // the key. In practice config is static per isNodeModule bucket (see
   // getPresets/getPlugins above), so isNodeModule is almost always
@@ -237,10 +254,31 @@ function cacheKeyFor(code: string, filepath: string, isNodeModule: boolean, conf
   // array is cheap to fold in too, and doing so makes this correct even
   // if that assumption ever stops holding, rather than relying on it.
   const configDigest = config ? fnv1a(JSON.stringify(config)) : 'noconfig';
-  return `${isNodeModule ? '1' : '0'}|${configDigest}|${fnv1a(code)}|${filepath.slice(filepath.lastIndexOf('/') + 1)}`;
+  // AINative tree-shaking fix (issue #1089): barrelAllowedNames changes
+  // this transform's OUTPUT (which re-export statements survive), so it
+  // MUST be part of the cache key -- otherwise a later compile (e.g. an
+  // HMR recompile after the app's imports changed, or simply a different
+  // real app in a different preview session reusing a still-warm worker)
+  // could serve a trim computed for a DIFFERENT app's narrower import set
+  // against this one, silently resolving a real import to undefined. An
+  // unsorted array is intentionally normalized (sorted) before hashing so
+  // the same logical set in a different collection order still hits the
+  // same cache entry.
+  const barrelDigest =
+    barrelAllowedNames === undefined
+      ? 'nobarrel'
+      : barrelAllowedNames === 'ALL'
+        ? 'all'
+        : fnv1a(Array.from(barrelAllowedNames).sort().join(','));
+  return `${isNodeModule ? '1' : '0'}|${configDigest}|${barrelDigest}|${fnv1a(code)}|${filepath.slice(filepath.lastIndexOf('/') + 1)}`;
 }
 
-async function transform({ code, filepath, config }: ITransformData): Promise<ITranspilationResult> {
+async function transform({
+  code,
+  filepath,
+  config,
+  barrelAllowedNames,
+}: ITransformData): Promise<ITranspilationResult> {
   const t0 = PROFILE_ENABLED ? performance.now() : 0;
   const isNodeModule = /node_modules/.test(filepath);
 
@@ -249,7 +287,7 @@ async function transform({ code, filepath, config }: ITransformData): Promise<IT
   // -- the volume problem this cache targets is entirely in node_modules
   // (1454/1455 and 1513/1514 of all transform calls in the two real
   // profiling runs backing this fix were on node_modules files).
-  const cacheKey = isNodeModule ? cacheKeyFor(code, filepath, isNodeModule, config) : null;
+  const cacheKey = isNodeModule ? cacheKeyFor(code, filepath, isNodeModule, config, barrelAllowedNames) : null;
   if (cacheKey) {
     const cached = transformCache.get(cacheKey);
     if (cached) {
@@ -283,6 +321,18 @@ async function transform({ code, filepath, config }: ITransformData): Promise<IT
   const requires: Set<string> = new Set();
   const presets = await getPresets(config?.presets ?? [], isNodeModule);
   const plugins = await getPlugins(config?.plugins ?? []);
+  // AINative tree-shaking fix (issue #1089): the barrel-trimming visitor
+  // MUST run before preset-env's own commonjs-module transform converts
+  // `export { X } from './y'` into a require() call -- plugins and
+  // presets merge into one traversal and plugins' visitors fire first on
+  // the way down (confirmed empirically, see this fix's PR description),
+  // so pushing it into `plugins` (not `presets`) here, same as
+  // collectDependencies below, is what makes a removed specifier never
+  // become a require() at all, rather than removing a require() after the
+  // fact (which dep-collector would already have recorded).
+  if (barrelAllowedNames !== undefined) {
+    plugins.push(barrelAwarePlugin({ allowedNames: barrelAllowedNames }));
+  }
   plugins.push(collectDependencies(requires));
   const t1 = PROFILE_ENABLED ? performance.now() : 0;
   const transformed = babel.transform(code, {
@@ -335,6 +385,88 @@ async function transform({ code, filepath, config }: ITransformData): Promise<IT
   return result;
 }
 
+export interface ICollectImportsData {
+  code: string;
+  filepath: string;
+  // No `config` field -- unlike `transform()`, this never needs the real
+  // per-filetype preset/plugin config (see collectImports()'s doc
+  // comment below for why that was tried and reverted after a measured
+  // regression). A fixed, minimal `typescript` + `react` preset pair
+  // parses any real JS/JSX/TS/TSX syntax this bundler's presets support
+  // today (both the react and solid presets only ever register
+  // `babel-transformer` for js/jsx/ts/tsx files -- see ReactPreset.ts/
+  // SolidPreset.ts's mapTransformers()).
+}
+
+export interface ICollectImportsResult {
+  /** Plain-object wire format: specifier -> ('ALL' | string[] of named
+   *  bindings used). See barrel-usage.ts. */
+  usage: Record<string, BarrelAllowedNames>;
+}
+
+// AINative tree-shaking fix (issue builder-ainative-studio#1089): a
+// separate, lightweight worker RPC used ONLY during bundler.ts's
+// pre-pass (collectAppBarrelUsage, called once per cold compile, before
+// any node_modules file is transformed). Deliberately NOT reusing
+// `transform` with some "collect-only" flag bolted on: this method never
+// needs a content-hash cache (app files aren't immutable across a
+// session, see babel-worker.ts's existing node_modules-only caching
+// rationale above) and never needs to report `requires`/dependencies --
+// keeping it a separate, minimal function makes both of those omissions
+// structural rather than something a future edit could accidentally
+// break by sharing code with the real transform path.
+//
+// Deliberately uses a MUCH lighter config than getPresets()/getPlugins()
+// (the real transform's config) -- a real regression was found and fixed
+// here: the pre-pass runs over EVERY file bundler.compile() is given,
+// which for a real Builder app includes not just the app's own ~10-15
+// files but the full getBuiltinFiles() shared shadcn/AIKit bundle
+// (~109 JS/TS-like files, confirmed live) -- 100+ EXTRA dispatches
+// through the SAME small (POOL_SIZE=4) worker pool the real compile's
+// own node_modules transforms are racing to finish through, all fired
+// essentially simultaneously via collectAppBarrelUsage's Promise.all
+// BEFORE the entry-point walk even starts. Measured regression on a real
+// app (T1i-e_AP3tK-LP6X16XJ2): baseline ~11.5-12s, this fix with the
+// FULL real-transform config for collectImports ~14-17.5s -- slower than
+// never tree-shaking at all, reproducible across 4 back-to-back runs.
+// The real `env`/`typescript`/`react` preset pipeline this pre-pass was
+// originally reusing exists to produce CORRECT RUNTIME OUTPUT (ES target
+// lowering, JSX runtime wiring) -- none of which this pre-pass needs: it
+// only ever reads `path.node.source`/`path.node.specifiers` off
+// already-parsed AST nodes, which requires PARSING the file's real
+// syntax (JSX, TypeScript types) but never requires LOWERING or
+// generating output code. Dropping `env` (the expensive preset -- it's
+// what does broad per-file bugfix/feature-detection AST scanning) and
+// requesting `ast: true, code: false` (skip codegen entirely) measured
+// ~3.5x faster per call in isolation and removes the only genuinely
+// heavy preset from this path, while keeping the exact same visitor,
+// same AST node shapes, same correctness.
+async function collectImports({ code, filepath }: ICollectImportsData): Promise<ICollectImportsResult> {
+  const sink = new Map<string, BarrelAllowedNames>();
+  try {
+    babel.transform(code, {
+      filename: filepath,
+      presets: ['typescript', ['react', { runtime: 'automatic' }]],
+      plugins: [barrelAwarePlugin({ sink })],
+      ast: true,
+      code: false,
+      sourceMaps: false,
+    });
+  } catch (err) {
+    // A file that fails to parse during this pre-pass will also fail to
+    // parse during its REAL compile later -- that failure surfaces
+    // normally and correctly there (as a real compilation error the app
+    // author sees), via the existing, unrelated error path. Silently
+    // skipping it here (empty usage) rather than throwing is correct and
+    // safe: this pre-pass exists only to make the tree-shaking narrower
+    // for files that parse fine, never to gate whether compilation can
+    // proceed -- that gate is the real compile step, untouched by this
+    // fix.
+    return { usage: {} };
+  }
+  return { usage: Object.fromEntries(sink) };
+}
+
 new WorkerMessageBus({
   channel: 'sandpack-babel',
   endpoint: self,
@@ -343,6 +475,8 @@ new WorkerMessageBus({
     switch (method) {
       case 'transform':
         return transform(data);
+      case 'collectImports':
+        return collectImports(data);
       default:
         return Promise.reject(new Error('Unknown method'));
     }

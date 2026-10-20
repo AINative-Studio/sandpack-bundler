@@ -827,13 +827,24 @@ export class Bundler {
       // previously-unseen import starting to resolve correctly instead
       // of throwing).
       for (const [path, newNames] of this.barrelUsage) {
-        if (newNames === 'ALL') continue;
         const oldNames = previousBarrelUsage.get(path);
         if (oldNames === 'ALL') continue;
-        const newSet = new Set(newNames);
-        const oldSet = new Set(oldNames ?? []);
-        const widened = Array.from(newSet).some((n) => !oldSet.has(n));
-        if (!widened) continue;
+        // AINative fix (issue builder-ainative-studio#1127): the current
+        // compile needing the FULL, untrimmed barrel ('ALL' -- a
+        // namespace import, `export *`, or an otherwise-unnarrowable
+        // specifier, see collectAppBarrelUsage()'s doc comment) is itself
+        // a widen relative to any specific prior trim cached at `path` --
+        // the previous compile's narrower module may be missing exports
+        // this compile's code actually needs. Falling through to the
+        // invalidation below (rather than `continue`-ing past it, as this
+        // branch used to) closes that gap; the oldNames==='ALL' check
+        // above still correctly skips when nothing narrower is cached.
+        if (newNames !== 'ALL') {
+          const newSet = new Set(newNames);
+          const oldSet = new Set(oldNames ?? []);
+          const widened = Array.from(newSet).some((n) => !oldSet.has(n));
+          if (!widened) continue;
+        }
 
         const existingModule = this.modules.get(path);
         if (!existingModule) continue;

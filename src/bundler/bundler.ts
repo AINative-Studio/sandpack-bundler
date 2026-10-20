@@ -827,12 +827,24 @@ export class Bundler {
       // previously-unseen import starting to resolve correctly instead
       // of throwing).
       for (const [path, newNames] of this.barrelUsage) {
-        if (newNames === 'ALL') continue;
         const oldNames = previousBarrelUsage.get(path);
         if (oldNames === 'ALL') continue;
-        const newSet = new Set(newNames);
-        const oldSet = new Set(oldNames ?? []);
-        const widened = Array.from(newSet).some((n) => !oldSet.has(n));
+
+        // newNames === 'ALL' means THIS compile's app code needs the
+        // barrel's full, untrimmed export surface (a namespace import,
+        // `export *`, or a dynamic/computed specifier
+        // collectAppBarrelUsage() can't safely narrow). oldNames is
+        // already confirmed not 'ALL' above, so whatever is cached for
+        // this path was compiled under that earlier, specific (narrower)
+        // trim. Moving to 'ALL' is itself a widen -- unrestricted is a
+        // superset of any specific set -- and must invalidate exactly
+        // like a widened specific-names set does below. The old code
+        // `continue`d here unconditionally, leaving the stale narrow
+        // trim cached and resolving this compile's unrestricted import
+        // against it -- a real gap, not just this HMR-widen case. #1127.
+        const widened =
+          newNames === 'ALL' ||
+          Array.from(new Set(newNames)).some((n) => !new Set(oldNames ?? []).has(n));
         if (!widened) continue;
 
         const existingModule = this.modules.get(path);

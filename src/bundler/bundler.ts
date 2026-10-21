@@ -817,30 +817,65 @@ export class Bundler {
     this.barrelUsagePromise = this.collectAppBarrelUsage(files).then(() => {
       // If a node_modules file was already compiled (and therefore
       // cached as "compiled" on its Module, see Module.ts's compiled !=
-      // null short-circuit) under a NARROWER allowed-names set than this
-      // compile just computed, that cached compile is now stale -- it
-      // may be missing a re-export a newly-added import needs. Force
-      // exactly those specific modules to recompile. This only ever
-      // WIDENS what a module exports (never narrows an already-working
-      // import out from under running code), so it cannot turn a
-      // working import into a broken one -- only the reverse (a
-      // previously-unseen import starting to resolve correctly instead
-      // of throwing).
+      // null short-circuit) under a DIFFERENT allowed-names set than this
+      // compile just computed, that cached compile is stale -- it may be
+      // missing a re-export the current compile's own code needs.
+      //
+      // AINative fix (issue builder-ainative-studio#1126): originally
+      // this only checked for WIDENING (newSet has a name oldSet
+      // lacks), on the reasoning that this bundler's `Bundler` instance
+      // (and therefore `this.modules`/`this.barrelUsage`) is reused
+      // across compiles ONLY within one app's own HMR session, where a
+      // narrower-than-before set can never happen (an app's own source
+      // only ever gains imports between HMR edits in the cases this
+      // fork actually triggers a recompile for, never loses the need
+      // for an import that was already working). That reasoning does
+      // NOT hold in production: `SandpackInstance` (src/index.ts)
+      // constructs exactly one `Bundler` per iframe, and that SAME
+      // iframe is reused by Builder across entirely unrelated
+      // companies' previews, one after another -- not just across HMR
+      // edits of a single app. When company B's own barrel usage is not
+      // a strict superset of whatever company A (the previous occupant
+      // of that same iframe/Bundler) left cached -- e.g. B needs a
+      // DIFFERENT set of lucide-react icons than A did, not a wider
+      // one -- `widened` was false, this loop skipped resetting the
+      // stale module, and B's `import {...} from 'lucide-react'`
+      // resolved against A's wrongly-trimmed compiled output, silently
+      // missing exports B's own code actually needs. That missing
+      // export becomes `undefined` at the import site, and React throws
+      // "Element type is invalid... got: undefined" -- confirmed live,
+      // reproducibly, on multiple real companies sharing a bundler
+      // instance (beacon, dwello, foresight, pathlo, shortlist, silo,
+      // clearpath -- see the issue for the live reproduction). Checking
+      // set INEQUALITY instead of only superset-widening closes this
+      // gap while changing nothing about the HMR case this block was
+      // originally written for: a same-app HMR edit that only ever
+      // widens still takes the exact same reset path as before (an
+      // inequality check is a strict generalization of the previous
+      // superset-only check, never a narrower one), and the reset
+      // itself (resetForWidenedBarrelUsage(), below) was already fully
+      // generic -- it clears this file's stale compiled output and
+      // re-queues its transform with no HMR-dirty flag and no reload,
+      // regardless of whether the allowed-names set grew, shrank, or
+      // simply changed to a different, same-size set; nothing in it
+      // assumes the change was specifically a widening.
       for (const [path, newNames] of this.barrelUsage) {
         if (newNames === 'ALL') continue;
         const oldNames = previousBarrelUsage.get(path);
         if (oldNames === 'ALL') continue;
         const newSet = new Set(newNames);
         const oldSet = new Set(oldNames ?? []);
-        const widened = Array.from(newSet).some((n) => !oldSet.has(n));
-        if (!widened) continue;
+        const changed =
+          newSet.size !== oldSet.size || Array.from(newSet).some((n) => !oldSet.has(n));
+        if (!changed) continue;
 
         const existingModule = this.modules.get(path);
         if (!existingModule) continue;
 
         // Only reset a module that was ACTUALLY run through a real
-        // babel.transform() with the stale (narrower) trim applied --
-        // never one that's merely sitting in this.modules as
+        // babel.transform() with the now-stale (differently-trimmed)
+        // allowed-names set applied -- never one that's merely sitting
+        // in this.modules as
         // ModuleRegistry's precompiled placeholder (every node_modules
         // file gets one of those pre-seeded by loadModuleDependencies(),
         // with compiled set directly to raw, never-transformed source --

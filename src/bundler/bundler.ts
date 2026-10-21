@@ -860,13 +860,22 @@ export class Bundler {
       // simply changed to a different, same-size set; nothing in it
       // assumes the change was specifically a widening.
       for (const [path, newNames] of this.barrelUsage) {
-        if (newNames === 'ALL') continue;
         const oldNames = previousBarrelUsage.get(path);
         if (oldNames === 'ALL') continue;
-        const newSet = new Set(newNames);
-        const oldSet = new Set(oldNames ?? []);
+        // #1127: newNames === 'ALL' means this compile's app code imports
+        // from the barrel in a way collectAppBarrelUsage() can't safely
+        // narrow (a namespace import, export *, a dynamic/computed
+        // specifier, etc.) -- it needs the barrel's FULL, untrimmed export
+        // surface. If the previous usage for this same path was a specific,
+        // narrower set (a different company's earlier compile in the same
+        // reused iframe/Bundler instance, or this app's own code changing
+        // shape), moving to 'ALL' is itself a widen and must invalidate any
+        // stale, narrowly-trimmed compiled module already cached at this
+        // path -- the old unconditional `if (newNames === 'ALL') continue`
+        // skipped that invalidation entirely, regardless of oldNames.
         const changed =
-          newSet.size !== oldSet.size || Array.from(newSet).some((n) => !oldSet.has(n));
+          newNames === 'ALL' ||
+          Array.from(new Set(newNames)).some((n) => !new Set(oldNames ?? []).has(n));
         if (!changed) continue;
 
         const existingModule = this.modules.get(path);
